@@ -1,103 +1,163 @@
-# FLOCK_CVE_SCANNER
+<p align="center">
+  <img src="https://img.shields.io/badge/Flock_Scan-v2.0-red?style=flat-square&logo=appveyor" />
+  <img src="https://img.shields.io/badge/CVEs-4-brightgreen?style=flat-square" />
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
+</p>
 
-**Scan and exploit with permission**
-
-## Overview
-
-FLOCK_CVE_SCANNER is a comprehensive security testing tool for identifying and validating CVE-2025 vulnerabilities. It features multi-threaded scanning, Shodan integration, and optional exploitation capabilities for authorized security assessments.
-
-## Features
-
-* CVE-2025-59403: Unauthenticated admin API / ADB RCE (CVSS 9.8)
-* CVE-2025-59407: Hardcoded keystore crypto key (Critical)
-* CVE-2025-47818: Hardcoded fallback hotspot credentials
-* CVE-2025-47823: Hardcoded system password on ALPR firmware <=2.2
-* Shodan integration with built-in queries
-* Multi-threaded scanning
-* Optional exploitation mode (disabled by default)
-* JSON output for results
-* Interactive and command-line modes
-
-## Installation
-
-```bash
-git clone https://github.com/ekomsSavior/FLOCK_CVE_SCANNER.git
-cd FLOCK_CVE_SCANNER
-pip install requests shodan ipaddress
+```
+███████╗██╗     ██████╗  ██████╗██╗  ██╗     ███████╗ ██████╗ █████╗ ███╗   ██╗
+██╔════╝██║    ██╔═══██╗██╔════╝██║ ██╔╝     ██╔════╝██╔════╝██╔══██╗████╗  ██║
+█████╗  ██║    ██║   ██║██║     █████╔╝      ███████╗██║     ███████║██╔██╗ ██║
+██╔══╝  ██║    ██║   ██║██║     ██╔═██╗      ╚════██║██║     ██╔══██║██║╚██╗██║
+██║     ███████╗╚██████╔╝██████╗██║  ██╗     ███████║╚██████╗██║  ██║██║ ╚████║
+╚═╝     ╚══════╝ ╚═════╝ ╚═════╝╚═╝  ╚═╝     ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
 ```
 
-## Usage
+Multi-mode Flock Safety security assessment tool.
 
-### Basic Scanning (Safe Mode)
+---
+
+## Capabilities
+
+### CVE Scanning (v1)
+| CVE | Score | Description |
+|-----|-------|-------------|
+| **CVE-2025-59403** | 9.8   | Unauthenticated admin API / ADB RCE |
+| **CVE-2025-59407** | CRIT  | Hardcoded keystore crypto key |
+| **CVE-2025-47818** | HIGH  | Hardcoded fallback hotspot credentials |
+| **CVE-2025-47823** | HIGH  | Hardcoded system password on ALPR firmware |
+
+### Flock Instance Discovery (v2 — NEW)
+Scans any subnet for all known Flock camera fingerprints.
+
+| Fingerprint | Port | Detection |
+|-------------|------|-----------|
+| **ADB shell** | 5555 | `getprop ro.product.model` → Flock/Falcon/Sparrow |
+| **Admin web UI** | 80/443 | GainSec's `admin_page_template.html` in HTTP body |
+| **ONVIF device** | 80/443/8899 | SOAP `GetDeviceInformation` → manufacturer string |
+| **SpeedPourer** | 21 | FTP banner / admin page references |
+| **FRP tunnel** | 7000-7500 | Fast Reverse Proxy banner grab |
+| **Cloud DNS** | — | Admin UI contains `*.flocksafety.com` URLs |
+| **All 4 CVEs** | — | Per-host exploit checks run automatically |
+
+### Traffic Analysis (v2 — NEW)
+Determines if a Flock camera sends data to **the cloud** or a **local station**.
+
+```
+CLOUD            →  Sends data to api.flocksafety.com / Flock infrastructure
+LOCAL_STATION    →  Data stays on-prem (no cloud contact detected)
+INDETERMINATE   →  Unable to determine (camera may be offline)
+```
+
+Detection methods:
+- **DNS resolution** of `api.flocksafety.com` and other Flock domains
+- **Admin UI inspection** — `/metadata`, `/config` endpoints checked for cloud URLs vs internal IPs
+- **FRP tunnel detection** — Reverse Proxy tunnel on ports 7000/7500
+- **ADB network config** — reads gateway and DNS from camera shell
+
+---
+
+##  Quick Start
+
+```bash
+pip install requests
+python3 scanner.py
+```
+
+### CVE Scanning
+```bash
+# Single target
+python3 scanner.py -t 192.168.1.100
+
+# From file
+python3 scanner.py -f targets.txt --exploit
+
+# Save results
+python3 scanner.py --output results.json -v
+```
+
+### Instance Discovery
+```bash
+# Scan a /24 subnet
+python3 scanner.py --discover 192.168.1.0/24
+
+# Scan a /16, save findings
+python3 scanner.py --discover 10.0.0.0/16 --output found.json
+```
+
+### Traffic Analysis
+```bash
+# Check if a camera phones home
+python3 scanner.py --analyze-traffic 192.168.1.100
+
+# Save flow analysis
+python3 scanner.py --analyze-traffic 10.0.0.50 --output flow.json
+```
+
+---
+
+##  Interactive Menu
 
 ```bash
 python3 scanner.py
 ```
 
-This runs in SCAN ONLY mode by default. It will identify vulnerable systems without executing any exploits.
-
-### Enabling Exploitation
-
-```bash
-python3 scanner.py --exploit
+```
+┌─────────────────────────────────────────┐
+│           SELECT INPUT METHOD           │
+├─────────────────────────────────────────┤
+│  1.  Single IP                          │
+│  2.  IP Range (CIDR)                    │
+│  3.  From File                          │
+│  4.  Shodan Query                       │
+│  5.  Falcon/Sparrow Signatures          │
+│                                         │
+│  ═══ NEW ═══                            │
+│  6.  Flock Instance Discovery           │
+│  7.  Traffic Analysis                   │
+│                                         │
+│  8.  Return                             │
+└─────────────────────────────────────────┘
 ```
 
-The exploitation flag must be explicitly set. This is a safety measure to prevent accidental exploitation.
+---
 
-### Command Line Options
+##  Shodan Queries
 
 ```bash
-python3 scanner.py -t 192.168.1.100           # Scan a single target
-python3 scanner.py -t 192.168.1.100 --exploit # Scan and exploit a single target
-python3 scanner.py -f targets.txt             # Scan from a file
-python3 scanner.py -f targets.txt --exploit   # Scan and exploit from a file
-python3 scanner.py -o results.json            # Save results to JSON
-python3 scanner.py -v --exploit               # Verbose output with exploitation
-python3 scanner.py -T 20 --timeout 10         # Increase threads and timeout
+python3 shodan_queries.py
 ```
 
-### Interactive Mode
+Includes dedicated `FLOCK_DISCOVERY` queries:
 
-1. Run `python3 scanner.py`
-2. Select an input method:
-   * Single IP
-   * IP Range (CIDR)
-   * From File
-   * Shodan Query (requires API key)
-   * Random Scan
-3. Enter targets or API keys when prompted
-4. Review results and choose to continue or exit
+| Query | Finds |
+|-------|-------|
+| `title:"admin_page_template"` | Flock admin portals |
+| `"/onvif/device_service" Flock` | ONVIF-capable Flock devices |
+| `"SpeedPourer" port:21` | Speed test FTP servers |
+| `"FRP" "flock" port:7000` | Reverse proxy tunnels |
+| `ssl.cert.subject.cn:"*.flocksafety.com"` | Flock TLS certificates |
+| `org:"Flock Safety"` | All Flock-owned infrastructure |
 
-### Shodan Integration
+---
 
-When prompted for a Shodan API key, enter your key. The scanner uses built-in queries specific to CVE-2025 vulnerabilities. The key is not stored or logged.
+## Safety
 
-## Safety Features
+- **Exploitation disabled by default** — requires explicit `--exploit` flag
+- **Rate-limited threads** — default 10, configurable with `-T`
+- **Discovery mode is passive** — only sends probe/identification packets
+- **User confirmation** required before any exploit execution
 
-* **Exploitation disabled by default**: The tool starts in SCAN ONLY mode
-* **User confirmation required**: --exploit flag must be explicitly set
-* **Non-destructive scanning**: Default payloads only check for vulnerabilities
-* **Rate limiting**: Configurable threads to avoid overwhelming targets
+```bash
+# Scan only (no exploitation)
+python3 scanner.py -t 192.168.1.100
 
-## Output
+# Scan + exploit (requires confirmation)
+python3 scanner.py -t 192.168.1.100 --exploit
+```
 
-Results are displayed in real-time with color-coded output:
-* Red: Critical vulnerabilities and successful exploits
-* Yellow: Medium severity findings
-* Green: Successful connections or findings
 
-When exploitation is enabled, successful exploits will show:
-* Command output
-* Extracted credentials or keys
-* Confirmation of access
 
-## Legal Notice
-
-**This tool is for authorized security testing only.** Use only on systems you own or have explicit written permission to test. Unauthorized scanning or exploitation may violate laws and regulations. The authors assume no liability for misuse.
-
-## Known Limitations
-
-* Shodan API requires an account and key
-* Free Shodan tier has rate limits
-* Some targets may require HTTPS
-* ADB exploitation requires port 5555 to be open
+<p align="center">
+  <sub>Authorized security testing only. Use on systems you own or have written permission to test.</sub>
+</p>
