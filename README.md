@@ -13,7 +13,7 @@
 ╚═╝     ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝     ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
 ```
 
-Multi-mode Flock Safety security assessment tool.
+Multi-mode Flock assessment tool.
 
 DISCALIMER: FOR AUTHORIZED SECURITY TESTING ONLY XO
 
