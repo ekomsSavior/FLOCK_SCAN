@@ -1,6 +1,5 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Flock_Scan-v3.1-red?style=flat-square&logo=appveyor" />
-  <img src="https://img.shields.io/badge/CVEs-4-brightgreen-brightgreen?style=flat-square" />
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
 </p>
 
