@@ -32,6 +32,13 @@ import argparse
 import csv
 import random
 
+# Import traffic tap module (optional)
+try:
+    from flock_tap import FlockTrafficTap, C as TapColors
+    HAVE_TAP = True
+except ImportError:
+    HAVE_TAP = False
+
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # ── Flock-known infrastructure for cloud detection ──
@@ -552,23 +559,23 @@ class CVEExploiter:
 
     def print_banner(self):
         banner = f"""
-{Colors.RED}===========================================================================
+{Colors.RED}================================================================================
                                                                            
-    {Colors.YELLOW}███████╗██╗   ██╗███████╗    ███████╗ ██████╗ █████╗ ███╗   ██╗   
-    {Colors.YELLOW}██═════╝██║   ██║██╔════╝    ██╔════╝██╔════╝██╔══██╗████╗  ██║   
-    {Colors.YELLOW}██      ██║   ██║█████╗      ███████╗██║     ███████║██╔██╗ ██║  
-    {Colors.YELLOW}██      ╚██╗ ██╔╝██╔══╝      ╚════██║██║     ██╔══██║██║╚██╗██║  
-    {Colors.YELLOW}███████╗ ╚████╔╝ ███████╗    ███████║╚██████╗██║  ██║██║ ╚████║  
-    {Colors.YELLOW}╚══════╝  ╚═══╝  ╚══════╝    ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
+    {Colors.YELLOW}███████╗██╗   ██╗███████╗    ███████╗ ██████╗ █████╗ ███╗   ██╗██████╗ ███████╗██████╗{Colors.RED}    
+    {Colors.YELLOW}██╔════╝██║   ██║██╔════╝    ██╔════╝██╔════╝██╔══██╗████╗  ██║██╔══██╗██╔════╝██╔══██╗{Colors.RED}   
+    {Colors.YELLOW}█████╗  ██║   ██║█████╗      ███████╗██║     ███████║██╔██╗ ██║██████╔╝█████╗  ██████╔╝{Colors.RED}   
+    {Colors.YELLOW}██╔══╝  ╚██╗ ██╔╝██╔══╝      ╚════██║██║     ██╔══██║██║╚██╗██║██╔══██╗██╔══╝  ██╔══██╗{Colors.RED}   
+    {Colors.YELLOW}███████╗ ╚████╔╝ ███████╗    ███████║╚██████╗██║  ██║██║ ╚████║██║  ██║███████╗██║  ██║{Colors.RED}   
+    {Colors.YELLOW}╚══════╝  ╚═══╝  ╚══════╝    ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝{Colors.RED}   
                                                                            
-    {Colors.CYAN}███████╗██╗  ██╗██████╗ ██╗      ██████╗ ██╗████████╗{Colors.RED}           
-    {Colors.CYAN}██╔════╝╚██╗██╔╝██╔══██╗██║     ██╔═══██╗██║╚══██╔══╝{Colors.RED}          
-    {Colors.CYAN}█████╗   ╚███╔╝ ██████╔╝██║     ██║   ██║██║   ██║   {Colors.RED}          
-    {Colors.CYAN}██╔══╝   ██╔██╗ ██╔═══╝ ██║     ██║   ██║██║   ██║   {Colors.RED}          
-    {Colors.CYAN}███████╗██╔╝ ██╗██║     ███████╗╚██████╔╝██║   ██║   {Colors.RED}          
-    {Colors.CYAN}╚══════╝╚═╝  ╚═╝╚═╝     ╚══════╝ ╚═════╝ ╚═╝   ╚═╝   {Colors.RED}          
+    {Colors.CYAN}███████╗██╗  ██╗██████╗ ██╗      ██████╗ ██╗████████╗███████╗██████╗ {Colors.RED}           
+    {Colors.CYAN}██╔════╝╚██╗██╔╝██╔══██╗██║     ██╔═══██╗██║╚══██╔══╝██╔════╝██╔══██╗{Colors.RED}          
+    {Colors.CYAN}█████╗   ╚███╔╝ ██████╔╝██║     ██║   ██║██║   ██║   █████╗  ██████╔╝{Colors.RED}          
+    {Colors.CYAN}██╔══╝   ██╔██╗ ██╔═══╝ ██║     ██║   ██║██║   ██║   ██╔══╝  ██╔══██╗{Colors.RED}          
+    {Colors.CYAN}███████╗██╔╝ ██╗██║     ███████╗╚██████╔╝██║   ██║   ███████╗██║  ██║{Colors.RED}          
+    {Colors.CYAN}╚══════╝╚═╝  ╚═╝╚═╝     ╚══════╝ ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝{Colors.RED}          
                                                                            
-==========================================================================={Colors.END}
+================================================================================{Colors.END}
 
 {Colors.RED}{Colors.BLINK}WARNING: EXPLOITATION MODULE INCLUDED{Colors.END}
 {Colors.YELLOW}Use only on systems you own or have explicit permission to test{Colors.END}
@@ -916,12 +923,14 @@ Exploited     : {self.exploited}
  3. From File (IPs list)
  4. Shodan Query (requires Shodan API)
  5. Falcon/Sparrow Signatures
- 6. Flock Instance Discovery (scan subnet)
- 7. Traffic Analysis (cloud vs station)
- 8. Return
+ 6. Flock Instance Discovery (scan subnet for fingerprints)
+ 7. Traffic Analysis (cloud vs local station)
+ 8. Traffic Tap — live monitor (requires scapy)
+ 9. Traffic Tap — analyze PCAP file
+ 0. Return
 -------------------------------------------------------------
 {Colors.END}""")
-        choice = input(f"{Colors.CYAN}Select option (1-8): {Colors.END}").strip()
+        choice = input(f"{Colors.CYAN}Select option (1-9, 0): {Colors.END}").strip()
 
         # ── 6: Flock Instance Discovery ──
         if choice == '6':
@@ -939,6 +948,50 @@ Exploited     : {self.exploited}
             if ip:
                 self.run_traffic_analysis(ip)
                 input(f"\n{Colors.CYAN}Press Enter to continue…{Colors.END}")
+            return []
+
+        # ── 8: Traffic Tap (live) ──
+        if choice == '8':
+            if not HAVE_TAP:
+                print(f"{Colors.RED}Error: flock_tap.py not found or scapy missing. pip install scapy{Colors.END}")
+                input(f"{Colors.CYAN}Press Enter…{Colors.END}")
+                return []
+            iface = input(f"{Colors.CYAN}Interface (e.g., eth0): {Colors.END}").strip()
+            if not iface:
+                return []
+            timeout_s = input(f"{Colors.CYAN}Capture duration in seconds (blank = unlimited): {Colors.END}").strip()
+            tap_out = input(f"{Colors.CYAN}Save report to file (blank = none): {Colors.END}").strip()
+            tap = FlockTrafficTap(
+                interface=iface,
+                verbose=self.verbose,
+                output_file=tap_out or None,
+                timeout=int(timeout_s) if timeout_s else None,
+            )
+            tap.start()
+            tap.report()
+            input(f"\n{Colors.CYAN}Press Enter to continue…{Colors.END}")
+            return []
+
+        # ── 9: Traffic Tap (pcap) ──
+        if choice == '9':
+            if not HAVE_TAP:
+                print(f"{Colors.RED}Error: flock_tap.py not found or scapy missing. pip install scapy{Colors.END}")
+                input(f"{Colors.CYAN}Press Enter…{Colors.END}")
+                return []
+            pcap_file = input(f"{Colors.CYAN}PCAP file path: {Colors.END}").strip()
+            if not pcap_file or not os.path.exists(pcap_file):
+                print(f"{Colors.RED}File not found: {pcap_file}{Colors.END}")
+                input(f"{Colors.CYAN}Press Enter…{Colors.END}")
+                return []
+            tap_out = input(f"{Colors.CYAN}Save report (blank = none): {Colors.END}").strip()
+            tap = FlockTrafficTap(
+                pcap=pcap_file,
+                verbose=self.verbose,
+                output_file=tap_out or None,
+            )
+            tap.start()
+            tap.report()
+            input(f"\n{Colors.CYAN}Press Enter to continue…{Colors.END}")
             return []
 
         # ── Original options ──
@@ -982,7 +1035,7 @@ Exploited     : {self.exploited}
             print("  - Port 5555 (ADB)")
             print("  - /api/v1/debug")
             print(f"{Colors.YELLOW}Requires Shodan or pre-generated targets{Colors.END}")
-        elif choice == '8':
+        elif choice == '0':
             return []
         return targets
 
@@ -1021,6 +1074,10 @@ def main():
     parser.add_argument('--cve', help='Scan specific CVE only')
     parser.add_argument('--discover', metavar='CIDR', help='Discover Flock instances in subnet (e.g. 192.168.1.0/24)')
     parser.add_argument('--analyze-traffic', metavar='IP', help='Analyze data flow for a camera IP')
+    parser.add_argument('--tap-interface', metavar='IFACE', help='Traffic Tap: live capture interface')
+    parser.add_argument('--tap-pcap', metavar='FILE', help='Traffic Tap: PCAP file to analyze')
+    parser.add_argument('--tap-pipe', action='store_true', help='Traffic Tap: read from stdin')
+    parser.add_argument('--tap-output', metavar='FILE', help='Traffic Tap: save report to JSON')
 
     args = parser.parse_args()
 
@@ -1044,6 +1101,31 @@ def main():
         scanner.run_traffic_analysis(args.analyze_traffic)
         if args.output:
             scanner.save_results()
+        return
+
+    # CLI shortcut for Traffic Tap
+    if args.tap_interface or args.tap_pcap or args.tap_pipe:
+        if not HAVE_TAP:
+            print(f"{Colors.RED}Error: flock_tap.py not found. Run: pip install scapy{Colors.END}")
+            sys.exit(1)
+        tap = FlockTrafficTap(
+            interface=args.tap_interface,
+            pcap=args.tap_pcap,
+            pipe=args.tap_pipe,
+            verbose=args.verbose,
+            output_file=args.tap_output or args.output,
+        )
+        tap.start()
+        tap.report()
+        if args.output:
+            # Save raw report too
+            rpt = tap.generate_report()
+            try:
+                with open(args.output, 'w') as f:
+                    json.dump(rpt, f, indent=2)
+                print(f"{Colors.GREEN}Tap report saved to {args.output}{Colors.END}")
+            except Exception as e:
+                print(f"{Colors.RED}Error saving: {e}{Colors.END}")
         return
 
     if args.target:
