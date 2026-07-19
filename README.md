@@ -12,7 +12,7 @@
 ╚═╝     ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝     ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
 ```
 
-Multi-mode Flock Safety security assessment tool.
+Multi-mode Flock Safety security assessment tool. Flock_scan is intended to see what else we are not seeing. Our hardwear hacker homies are killing it on scanning the phsyical layer so i built flock_scan to help scan the network and application layers.
 
 ---
 
