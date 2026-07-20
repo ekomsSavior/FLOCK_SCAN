@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import time
+import signal
 import threading
 import subprocess
 from datetime import datetime
@@ -44,8 +45,6 @@ FLOCK_CLOUD_IPS = [
 # Scapy availability
 try:
     from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, Raw, conf
-    from scapy.layers.tls.all import TLS
-    from scapy.layers.tls.handshake import TLSClientHello
     HAVE_SCAPY = True
 except ImportError:
     HAVE_SCAPY = False
@@ -112,6 +111,10 @@ class FlockTrafficTap:
 
         self.seen_domains = set()
         self.frp_ports = {7000, 7500, 7001, 7002}
+        # Known Flock cloud IPs: static seed list + IPs learned from DNS answers
+        # for Flock domains. Used to catch cameras that talk to cloud IPs without
+        # exposing an SNI or issuing their own DNS query.
+        self.known_flock_ips = set(FLOCK_CLOUD_IPS)
         self.running = False
         self.packet_count = 0
         self.start_time = None
@@ -121,15 +124,23 @@ class FlockTrafficTap:
     # ═══════════════════════════════════════════════════
 
     def on_dns_query(self, hostname, src_ip, resolved_ips=None, timestamp=None):
-        """Called for every DNS query. Updates flow_stats."""
-        if "flocksafety" in hostname.lower():
+        """Called for every DNS query. Updates flow_stats and learns Flock IPs."""
+        h = hostname.lower()
+        if "flocksafety" in h or "auth0.com" in h:
             self.flow_stats[src_ip]["cloud_dns"] += 1
+            # Learn the resolved addresses so we can later flag cameras that
+            # connect straight to these IPs without their own DNS/SNI.
+            for rip in (resolved_ips or []):
+                self.known_flock_ips.add(rip)
 
     def on_tcp_connect(self, src, dst, sport, dport, timestamp=None):
-        """Called for every TCP SYN. Updates flow_stats."""
+        """Called for every TCP packet. Updates flow_stats.
+
+        Byte accounting is handled from real ``ip.len`` in the packet handler;
+        this only tracks connection signals so it does not inflate bandwidth.
+        """
         fs = self.flow_stats[src]
         fs["connections"] += 1
-        fs["bytes_up"] += 64  # approximate
         if dport in self.frp_ports:
             fs["frp_tunnel"] = True
 
@@ -165,6 +176,8 @@ class FlockTrafficTap:
         if stats.get("cloud_dns", 0) > 0 or stats.get("frp_tunnel"):
             return "CLOUD_CONNECTED"
         if stats.get("s3_uploads", 0) > 0 or stats.get("auth_tls", 0) > 0:
+            return "CLOUD_CONNECTED"
+        if stats.get("cloud_api", 0) > 0:
             return "CLOUD_CONNECTED"
         if stats.get("connections", 0) > 0:
             return "LOCAL_STATION"
@@ -255,46 +268,53 @@ class FlockTrafficTap:
 
             self.on_tcp_connect(src, dst, sport, dport, ts)
 
+            # ── Connection to a known Flock cloud IP (no SNI/DNS needed) ──
+            if dst in self.known_flock_ips:
+                self.flow_stats[src]["cloud_api"] += 1
+
             if tcp.flags & 0x02:  # SYN
                 dev["connections"].append({
                     "timestamp": ts, "src": src, "sport": sport,
                     "dst": dst, "dport": dport, "bytes": ip.len,
                 })
 
-                # ── FRP Tunnel Detection ──
-                # FRP handshake pattern:
-                #   1. Camera connects to port 7000-7500 on a remote server
-                #   2. Sends auth + proxy configuration JSON
-                #   3. Server opens reverse tunnel
-                #
-                # Detection signature (Zeek-equivalent):
-                #   signature frp-tunnel {
-                #     ip-proto == tcp
-                #     dst-port in [7000, 7500, 7001, 7002]
-                #     payload /frp|auth|proxy_type/
-                #     event "FRP TUNNEL DETECTED"
-                #   }
-                if dport in self.frp_ports:
+            # ── FRP Tunnel Detection ──
+            # FRP handshake pattern:
+            #   1. Camera connects to port 7000-7500 on a remote server
+            #   2. Sends auth + proxy configuration JSON
+            #   3. Server opens reverse tunnel
+            #
+            # Detection signature (Zeek-equivalent):
+            #   signature frp-tunnel {
+            #     ip-proto == tcp
+            #     dst-port in [7000, 7500, 7001, 7002]
+            #     payload /frp|auth|proxy_type/
+            #     event "FRP TUNNEL DETECTED"
+            #   }
+            # Port-based signal is evaluated per-packet (fires on the SYN too).
+            if dport in self.frp_ports:
+                self.flow_stats[src]["frp_tunnel"] = True
+                dev["frp_tunnels"].append({
+                    "timestamp": ts, "src": src, "dst": dst,
+                    "port": dport, "type": "frp_tunnel",
+                })
+                if self.verbose:
+                    print(f"  {C.R}FRP  {src:<16} -> {dst}:{dport}  [FRP TUNNEL]{C.END}")
+
+            # Raw payload scan for FRP auth. The auth/proxy JSON is sent in a
+            # data segment *after* the handshake, so this must run on every TCP
+            # packet — not only on the SYN (SYN packets carry no payload).
+            if tcp.haslayer(Raw):
+                raw = tcp[Raw].load
+                if b"frp" in raw.lower() or b"auth" in raw.lower() or b"proxy_type" in raw.lower():
                     self.flow_stats[src]["frp_tunnel"] = True
                     dev["frp_tunnels"].append({
                         "timestamp": ts, "src": src, "dst": dst,
-                        "port": dport, "type": "frp_tunnel",
+                        "port": dport, "type": "frp_auth_payload",
+                        "payload_preview": raw[:64].decode(errors="replace"),
                     })
                     if self.verbose:
-                        print(f"  {C.R}FRP  {src:<16} -> {dst}:{dport}  [FRP TUNNEL]{C.END}")
-
-                # Raw payload scan for FRP auth
-                if tcp.haslayer(Raw):
-                    raw = tcp[Raw].load
-                    if b"frp" in raw.lower() or b"auth" in raw.lower() or b"proxy_type" in raw.lower():
-                        self.flow_stats[src]["frp_tunnel"] = True
-                        dev["frp_tunnels"].append({
-                            "timestamp": ts, "src": src, "dst": dst,
-                            "port": dport, "type": "frp_auth_payload",
-                            "payload_preview": raw[:64].decode(errors="replace"),
-                        })
-                        if self.verbose:
-                            self.log(f"{C.R}FRP_AUTH  {src} -> {dst}:{dport} - auth payload{C.END}")
+                        self.log(f"{C.R}FRP_AUTH  {src} -> {dst}:{dport} - auth payload{C.END}")
 
         # ── TLS SNI ──
         if pkt.haslayer(TCP) and pkt.haslayer(Raw):
@@ -394,10 +414,22 @@ class FlockTrafficTap:
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"{C.CY}[{ts}]{C.END} {msg}")
 
+    def _install_sigint(self):
+        """Stop capture cleanly on Ctrl+C so the report is always produced."""
+        def _handler(signum, frame):
+            self.running = False
+            raise KeyboardInterrupt
+        try:
+            signal.signal(signal.SIGINT, _handler)
+        except (ValueError, RuntimeError):
+            # Not on the main thread — fall back to scapy's own handling.
+            pass
+
     def start(self):
         """Start capture in the foreground."""
         self.start_time = time.time()
         self.running = True
+        self._install_sigint()
         if self.pcap:
             self._run_pcap()
         elif self.pipe:
