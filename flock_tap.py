@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import time
+import signal
 import threading
 import subprocess
 from datetime import datetime
@@ -41,11 +42,15 @@ FLOCK_CLOUD_IPS = [
     "104.18.16.189", "104.18.17.189",
 ]
 
+# ── Canonical verdict vocabulary (single source of truth) ──
+# Every device maps to exactly one of these so audit summary counts reconcile.
+VERDICT_CLOUD = "CLOUD_CONNECTED"
+VERDICT_LOCAL = "LOCAL_STATION"
+VERDICT_INDETERMINATE = "INDETERMINATE"
+
 # Scapy availability
 try:
     from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, Raw, conf
-    from scapy.layers.tls.all import TLS
-    from scapy.layers.tls.handshake import TLSClientHello
     HAVE_SCAPY = True
 except ImportError:
     HAVE_SCAPY = False
@@ -73,7 +78,8 @@ class FlockTrafficTap:
     """
 
     def __init__(self, interface=None, pcap=None, pipe=False, verbose=False,
-                 output_file=None, timeout=None, filter_expr=None):
+                 output_file=None, timeout=None, filter_expr=None,
+                 max_samples=500, redact_non_flock_ips=False):
         self.interface = interface
         self.pcap = pcap
         self.pipe = pipe
@@ -81,6 +87,16 @@ class FlockTrafficTap:
         self.output_file = output_file
         self.timeout = timeout
         self.filter_expr = filter_expr
+
+        # Data-minimization knobs (see AUDIT_INTEGRITY_SPEC.md).
+        # max_samples caps per-device raw sample lists so a long audit does not
+        # accrete an unbounded pile of raw records; integer counters below stay
+        # exact regardless. redact_non_flock_ips salt-hashes non-Flock dst IPs
+        # in stored samples to protect bystanders (off by default: hashing
+        # removes reproducibility a Flock-side auditor may need).
+        self.max_samples = max_samples
+        self.redact_non_flock_ips = redact_non_flock_ips
+        self._redact_salt = os.urandom(16)
 
         # ── flow_stats: matches pseudocode structure ──
         self.flow_stats = defaultdict(lambda: {
@@ -103,6 +119,10 @@ class FlockTrafficTap:
             "frp_tunnels": [],
             "tls_snis": [],
             "http_requests": [],
+            "cloud_ip_contacts": [],
+            # Exact running totals — always incremented even after the sample
+            # lists above stop growing at max_samples, so counts/verdicts hold.
+            "counts": {"dns": 0, "conn": 0, "frp": 0, "sni": 0, "flock_dns": 0},
             "bytes_up": 0,
             "bytes_down": 0,
             "packets_seen": 0,
@@ -112,6 +132,10 @@ class FlockTrafficTap:
 
         self.seen_domains = set()
         self.frp_ports = {7000, 7500, 7001, 7002}
+        # Known Flock cloud IPs: static seed list + IPs learned from DNS answers
+        # for Flock domains. Used to catch cameras that talk to cloud IPs without
+        # exposing an SNI or issuing their own DNS query.
+        self.known_flock_ips = set(FLOCK_CLOUD_IPS)
         self.running = False
         self.packet_count = 0
         self.start_time = None
@@ -121,15 +145,23 @@ class FlockTrafficTap:
     # ═══════════════════════════════════════════════════
 
     def on_dns_query(self, hostname, src_ip, resolved_ips=None, timestamp=None):
-        """Called for every DNS query. Updates flow_stats."""
-        if "flocksafety" in hostname.lower():
+        """Called for every DNS query. Updates flow_stats and learns Flock IPs."""
+        h = hostname.lower()
+        if "flocksafety" in h or "auth0.com" in h:
             self.flow_stats[src_ip]["cloud_dns"] += 1
+            # Learn the resolved addresses so we can later flag cameras that
+            # connect straight to these IPs without their own DNS/SNI.
+            for rip in (resolved_ips or []):
+                self.known_flock_ips.add(rip)
 
     def on_tcp_connect(self, src, dst, sport, dport, timestamp=None):
-        """Called for every TCP SYN. Updates flow_stats."""
+        """Called for every TCP packet. Updates flow_stats.
+
+        Byte accounting is handled from real ``ip.len`` in the packet handler;
+        this only tracks connection signals so it does not inflate bandwidth.
+        """
         fs = self.flow_stats[src]
         fs["connections"] += 1
-        fs["bytes_up"] += 64  # approximate
         if dport in self.frp_ports:
             fs["frp_tunnel"] = True
 
@@ -159,36 +191,57 @@ class FlockTrafficTap:
     #  CLASSIFICATION  — matches pseudocode interface
     # ═══════════════════════════════════════════════════
 
+    def _classify(self, ip):
+        """Single source of truth for a device verdict.
+
+        Folds flow-stat signals and device-level raw fallback into exactly one
+        canonical verdict so audit summary counts always reconcile.
+        """
+        stats = self.flow_stats[ip]
+        # Cloud signals from the per-flow counters.
+        if (stats.get("cloud_dns", 0) > 0 or stats.get("frp_tunnel")
+                or stats.get("s3_uploads", 0) > 0 or stats.get("auth_tls", 0) > 0
+                or stats.get("cloud_api", 0) > 0):
+            return VERDICT_CLOUD
+
+        # Cloud signals from the raw device store (fallback when flow_stats is
+        # sparse — e.g. SNI/FRP seen but no counter set).
+        dev = self.devices.get(ip, {})
+        if dev:
+            has_flock_sni = any(
+                "flock" in s.get("sni", "").lower() or "auth0" in s.get("sni", "").lower()
+                for s in dev.get("tls_snis", [])
+            )
+            if has_flock_sni or dev.get("frp_tunnels") or dev.get("cloud_ip_contacts"):
+                return VERDICT_CLOUD
+
+        # Traffic seen but no cloud signal → stays on-prem.
+        if stats.get("connections", 0) > 0 or (dev and dev.get("connections")):
+            return VERDICT_LOCAL
+
+        return VERDICT_INDETERMINATE
+
+    # Public names kept as thin wrappers so existing callers/tests stay valid.
     def classify_device(self, camera_ip):
-        """Generate a full traffic profile for a camera (from pseudocode)."""
-        stats = self.flow_stats[camera_ip]
-        if stats.get("cloud_dns", 0) > 0 or stats.get("frp_tunnel"):
-            return "CLOUD_CONNECTED"
-        if stats.get("s3_uploads", 0) > 0 or stats.get("auth_tls", 0) > 0:
-            return "CLOUD_CONNECTED"
-        if stats.get("connections", 0) > 0:
-            return "LOCAL_STATION"
-        return "OFFLINE_OR_UNMONITORED"
+        return self._classify(camera_ip)
 
     def classify_camera(self, ip):
-        """Return verdict for a single camera IP (raw data fallback)."""
-        verdict = self.classify_device(ip)
-        if verdict != "OFFLINE_OR_UNMONITORED":
-            return verdict
+        return self._classify(ip)
 
-        dev = self.devices.get(ip, {})
-        if not dev:
-            return "NO_DATA"
-        has_flock_sni = any(
-            "flock" in s.get("sni", "").lower() or "auth0" in s.get("sni", "").lower()
-            for s in dev.get("tls_snis", [])
-        )
-        has_frp = len(dev.get("frp_tunnels", [])) > 0
-        if has_flock_sni or has_frp:
-            return "CLOUD_CONNECTED"
-        if dev.get("connections"):
-            return "LOCAL_STATION"
-        return "UNKNOWN"
+    # ── data-minimization helpers ──
+    def _append_capped(self, lst, item):
+        """Append a raw sample only while under the cap. Counters (kept
+        separately) stay exact, so bounding samples never skews verdicts."""
+        if len(lst) < self.max_samples:
+            lst.append(item)
+
+    def _redact_ip(self, ip):
+        """Salt-hash a non-Flock IP for bystander protection. Known-Flock IPs
+        pass through unchanged so cloud evidence stays legible."""
+        if not self.redact_non_flock_ips or ip in self.known_flock_ips:
+            return ip
+        import hashlib
+        return "redacted:" + hashlib.sha256(self._redact_salt + ip.encode()).hexdigest()[:12]
 
     # ═══════════════════════════════════════════════════
     #  PACKET HANDLER  — scapy
@@ -233,7 +286,10 @@ class FlockTrafficTap:
                             pass
 
                 self.on_dns_query(qname, src, resolved_ips, ts)
-                dev["dns_queries"].append({
+                dev["counts"]["dns"] += 1
+                if "flock" in qname.lower() or "auth0" in qname.lower():
+                    dev["counts"]["flock_dns"] += 1
+                self._append_capped(dev["dns_queries"], {
                     "timestamp": ts, "src": src,
                     "query": qname, "resolved_ips": resolved_ips,
                 })
@@ -255,46 +311,64 @@ class FlockTrafficTap:
 
             self.on_tcp_connect(src, dst, sport, dport, ts)
 
+            # ── Connection to a known Flock cloud IP (no SNI/DNS needed) ──
+            if dst in self.known_flock_ips:
+                self.flow_stats[src]["cloud_api"] += 1
+                if dst not in dev["cloud_ip_contacts"]:
+                    dev["cloud_ip_contacts"].append(dst)
+
             if tcp.flags & 0x02:  # SYN
-                dev["connections"].append({
+                dev["counts"]["conn"] += 1
+                self._append_capped(dev["connections"], {
                     "timestamp": ts, "src": src, "sport": sport,
-                    "dst": dst, "dport": dport, "bytes": ip.len,
+                    "dst": self._redact_ip(dst), "dport": dport, "bytes": ip.len,
                 })
 
-                # ── FRP Tunnel Detection ──
-                # FRP handshake pattern:
-                #   1. Camera connects to port 7000-7500 on a remote server
-                #   2. Sends auth + proxy configuration JSON
-                #   3. Server opens reverse tunnel
-                #
-                # Detection signature (Zeek-equivalent):
-                #   signature frp-tunnel {
-                #     ip-proto == tcp
-                #     dst-port in [7000, 7500, 7001, 7002]
-                #     payload /frp|auth|proxy_type/
-                #     event "FRP TUNNEL DETECTED"
-                #   }
-                if dport in self.frp_ports:
+            # ── FRP Tunnel Detection ──
+            # FRP handshake pattern:
+            #   1. Camera connects to port 7000-7500 on a remote server
+            #   2. Sends auth + proxy configuration JSON
+            #   3. Server opens reverse tunnel
+            #
+            # Detection signature (Zeek-equivalent):
+            #   signature frp-tunnel {
+            #     ip-proto == tcp
+            #     dst-port in [7000, 7500, 7001, 7002]
+            #     payload /frp|auth|proxy_type/
+            #     event "FRP TUNNEL DETECTED"
+            #   }
+            # Port-based signal is evaluated per-packet (fires on the SYN too).
+            if dport in self.frp_ports:
+                self.flow_stats[src]["frp_tunnel"] = True
+                dev["counts"]["frp"] += 1
+                self._append_capped(dev["frp_tunnels"], {
+                    "timestamp": ts, "src": src, "dst": self._redact_ip(dst),
+                    "port": dport, "type": "frp_tunnel",
+                })
+                if self.verbose:
+                    print(f"  {C.R}FRP  {src:<16} -> {dst}:{dport}  [FRP TUNNEL]{C.END}")
+
+            # Raw payload scan for FRP auth. The auth/proxy JSON is sent in a
+            # data segment *after* the handshake, so this must run on every TCP
+            # packet — not only on the SYN (SYN packets carry no payload).
+            if tcp.haslayer(Raw):
+                raw = tcp[Raw].load
+                low = raw.lower()
+                matched = next((k for k in (b"frp", b"auth", b"proxy_type") if k in low), None)
+                if matched:
                     self.flow_stats[src]["frp_tunnel"] = True
-                    dev["frp_tunnels"].append({
-                        "timestamp": ts, "src": src, "dst": dst,
-                        "port": dport, "type": "frp_tunnel",
+                    dev["counts"]["frp"] += 1
+                    # Store a non-content descriptor, not the raw bytes: which
+                    # keyword matched + payload length. Proves FRP detection
+                    # without retaining any of the payload (bystander protection).
+                    self._append_capped(dev["frp_tunnels"], {
+                        "timestamp": ts, "src": src, "dst": self._redact_ip(dst),
+                        "port": dport, "type": "frp_auth_payload",
+                        "matched_keyword": matched.decode(),
+                        "payload_len": len(raw),
                     })
                     if self.verbose:
-                        print(f"  {C.R}FRP  {src:<16} -> {dst}:{dport}  [FRP TUNNEL]{C.END}")
-
-                # Raw payload scan for FRP auth
-                if tcp.haslayer(Raw):
-                    raw = tcp[Raw].load
-                    if b"frp" in raw.lower() or b"auth" in raw.lower() or b"proxy_type" in raw.lower():
-                        self.flow_stats[src]["frp_tunnel"] = True
-                        dev["frp_tunnels"].append({
-                            "timestamp": ts, "src": src, "dst": dst,
-                            "port": dport, "type": "frp_auth_payload",
-                            "payload_preview": raw[:64].decode(errors="replace"),
-                        })
-                        if self.verbose:
-                            self.log(f"{C.R}FRP_AUTH  {src} -> {dst}:{dport} - auth payload{C.END}")
+                        self.log(f"{C.R}FRP_AUTH  {src} -> {dst}:{dport} - auth payload{C.END}")
 
         # ── TLS SNI ──
         if pkt.haslayer(TCP) and pkt.haslayer(Raw):
@@ -305,7 +379,11 @@ class FlockTrafficTap:
                 sni = self._extract_sni(raw)
                 if sni:
                     self.on_tls_sni(sni, src, dst, ts)
-                    dev["tls_snis"].append({"timestamp": ts, "src": src, "dst": dst, "sni": sni})
+                    dev["counts"]["sni"] += 1
+                    self._append_capped(dev["tls_snis"], {
+                        "timestamp": ts, "src": src,
+                        "dst": self._redact_ip(dst), "sni": sni,
+                    })
                     if self.verbose:
                         cat = self._categorize_sni(sni)
                         c = C.R if cat else C.CY
@@ -394,10 +472,22 @@ class FlockTrafficTap:
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"{C.CY}[{ts}]{C.END} {msg}")
 
+    def _install_sigint(self):
+        """Stop capture cleanly on Ctrl+C so the report is always produced."""
+        def _handler(signum, frame):
+            self.running = False
+            raise KeyboardInterrupt
+        try:
+            signal.signal(signal.SIGINT, _handler)
+        except (ValueError, RuntimeError):
+            # Not on the main thread — fall back to scapy's own handling.
+            pass
+
     def start(self):
         """Start capture in the foreground."""
         self.start_time = time.time()
         self.running = True
+        self._install_sigint()
         if self.pcap:
             self._run_pcap()
         elif self.pipe:
@@ -459,14 +549,18 @@ class FlockTrafficTap:
                     if parsed["type"] == "dns":
                         query = parsed.get("query", "")
                         if query:
-                            dev["dns_queries"].append({
+                            dev["counts"]["dns"] += 1
+                            is_flock = "flock" in query.lower() or "auth0" in query.lower()
+                            if is_flock:
+                                dev["counts"]["flock_dns"] += 1
+                            self._append_capped(dev["dns_queries"], {
                                 "timestamp": time.time(),
                                 "src": src,
                                 "query": query,
                                 "resolved_ips": [],
                             })
                             self.seen_domains.add(query)
-                            if "flock" in query.lower():
+                            if is_flock:
                                 self.flow_stats[src]["cloud_dns"] += 1
                                 if self.verbose:
                                     self.log(f"{C.R}Flock DNS  {src} -> {query}{C.END}")
@@ -474,9 +568,10 @@ class FlockTrafficTap:
                                 self.log(f"{C.CY}DNS  {src} -> {query}{C.END}")
                     if parsed["type"] == "syn" and dport in self.frp_ports:
                         self.flow_stats[src]["frp_tunnel"] = True
-                        dev["frp_tunnels"].append({
+                        dev["counts"]["frp"] += 1
+                        self._append_capped(dev["frp_tunnels"], {
                             "timestamp": time.time(), "src": src,
-                            "dst": dst, "port": dport, "type": "frp_tunnel",
+                            "dst": self._redact_ip(dst), "port": dport, "type": "frp_tunnel",
                         })
                         if self.verbose:
                             self.log(f"{C.R}FRP  {src} -> {dst}:{dport}{C.END}")
@@ -504,18 +599,12 @@ class FlockTrafficTap:
             "summary": {},
         }
 
-        cloud_count = 0
-        local_count = 0
-        unknown_count = 0
+        counts = {VERDICT_CLOUD: 0, VERDICT_LOCAL: 0, VERDICT_INDETERMINATE: 0}
 
-        for ip in sorted(set(list(self.devices.keys()) + list(self.flow_stats.keys()))):
-            verdict = self.classify_camera(ip)
-            if verdict == "CLOUD_CONNECTED":
-                cloud_count += 1
-            elif verdict == "LOCAL_STATION":
-                local_count += 1
-            else:
-                unknown_count += 1
+        all_ips = sorted(set(list(self.devices.keys()) + list(self.flow_stats.keys())))
+        for ip in all_ips:
+            verdict = self._classify(ip)
+            counts[verdict] += 1
 
             # Always include flow_stats
             report["flow_stats"][ip] = dict(self.flow_stats[ip])
@@ -524,8 +613,10 @@ class FlockTrafficTap:
             if dev.get("packets_seen", 0) < 5:
                 continue
 
-            snis = list(set(s["sni"] for s in dev.get("tls_snis", [])))
-            dns_list = list(set(q["query"] for q in dev.get("dns_queries", [])))
+            c = dev.get("counts", {})
+            snis = sorted(set(s["sni"] for s in dev.get("tls_snis", [])))
+            dns_list = sorted(set(q["query"] for q in dev.get("dns_queries", [])))
+            cloud_ips = list(dev.get("cloud_ip_contacts", []))
 
             report["devices"][ip] = {
                 "verdict": verdict,
@@ -534,31 +625,44 @@ class FlockTrafficTap:
                 "bytes_down": dev["bytes_down"],
                 "first_seen": dev["first_seen"],
                 "last_seen": dev["last_seen"],
-                "dns_queries_count": len(dev["dns_queries"]),
-                "tls_snis_count": len(dev.get("tls_snis", [])),
-                "frp_tunnels_count": len(dev.get("frp_tunnels", [])),
-                "connections_count": len(dev.get("connections", [])),
+                # Exact counters (not len() of the capped sample lists).
+                "dns_queries_count": c.get("dns", len(dev["dns_queries"])),
+                "tls_snis_count": c.get("sni", len(dev.get("tls_snis", []))),
+                "frp_tunnels_count": c.get("frp", len(dev.get("frp_tunnels", []))),
+                "connections_count": c.get("conn", len(dev.get("connections", []))),
+                "samples_capped_at": self.max_samples,
                 "flow_stats": dict(self.flow_stats[ip]),
-                "tls_snis": snis,
+                # Metadata-only destination evidence — who the device talks to,
+                # never payload contents.
+                "destination_summary": {
+                    "dns_domains": dns_list,
+                    "tls_snis": snis,
+                    "flock_cloud_ips": cloud_ips,
+                },
                 "frp_tunnels": dev.get("frp_tunnels", []),
-                "dns_domains": dns_list,
             }
 
         report["summary"] = {
-            "total_ips_tracked": len(self.devices),
-            "cloud_connected": cloud_count,
-            "local_station": local_count,
-            "unknown": unknown_count,
+            "total_ips_tracked": len(all_ips),
+            "cloud_connected": counts[VERDICT_CLOUD],
+            "local_station": counts[VERDICT_LOCAL],
+            "indeterminate": counts[VERDICT_INDETERMINATE],
+            # Invariant: the three buckets partition every tracked IP.
+            "counts_reconcile": (
+                counts[VERDICT_CLOUD] + counts[VERDICT_LOCAL]
+                + counts[VERDICT_INDETERMINATE] == len(all_ips)
+            ),
             "flock_domains_resolved": sorted(
-                d for d in self.seen_domains if "flock" in d.lower()
+                d for d in self.seen_domains
+                if "flock" in d.lower() or "auth0" in d.lower()
             ),
             "total_flock_queries": sum(
-                1 for dev in self.devices.values()
-                for q in dev.get("dns_queries", [])
-                if "flock" in q.get("query", "").lower()
+                dev.get("counts", {}).get("flock_dns", 0)
+                for dev in self.devices.values()
             ),
             "total_frp_tunnels": sum(
-                len(dev.get("frp_tunnels", [])) for dev in self.devices.values()
+                dev.get("counts", {}).get("frp", 0)
+                for dev in self.devices.values()
             ),
         }
         return report
@@ -601,15 +705,16 @@ class FlockTrafficTap:
         print(f"  Duration:    {elapsed:.1f}s")
         print(f"  Packets:     {self.packet_count:,}")
 
-        cloud_cams = []
-        for ip in sorted(self.devices):
-            if self.classify_camera(ip) == "CLOUD_CONNECTED":
-                cloud_cams.append(ip)
+        # Partition every tracked IP into exactly one bucket (counts reconcile).
+        verdicts = {ip: self._classify(ip) for ip in self.devices}
+        cloud_cams = [ip for ip, v in sorted(verdicts.items()) if v == VERDICT_CLOUD]
+        local_n = sum(1 for v in verdicts.values() if v == VERDICT_LOCAL)
+        indet_n = sum(1 for v in verdicts.values() if v == VERDICT_INDETERMINATE)
 
         print(f"\n{C.CY}Classification:{C.END}")
         print(f"  Cloud-connected:  {len(cloud_cams)}")
-        print(f"  Local station:    {sum(1 for ip in self.devices if self.classify_camera(ip) == 'LOCAL_STATION')}")
-        print(f"  Unknown:          {sum(1 for ip in self.devices if self.classify_camera(ip) == 'UNKNOWN')}")
+        print(f"  Local station:    {local_n}")
+        print(f"  Indeterminate:    {indet_n}")
 
         if cloud_cams:
             print(f"\n{C.R}Cloud-Connected Cameras:{C.END}")
@@ -617,17 +722,27 @@ class FlockTrafficTap:
                 dev = self.devices[ip]
                 evidence = []
                 dns_list = list(set(q["query"] for q in dev.get("dns_queries", [])
-                                     if "flock" in q["query"].lower()))
+                                     if "flock" in q["query"].lower() or "auth0" in q["query"].lower()))
                 snis = list(set(s["sni"] for s in dev.get("tls_snis", [])
                                 if "flock" in s["sni"].lower() or "auth0" in s["sni"].lower()))
                 frps = dev.get("frp_tunnels", [])
+                cloud_ips = dev.get("cloud_ip_contacts", [])
                 if dns_list:
                     evidence.append(f"DNS({', '.join(dns_list[:3])})")
                 if snis:
                     evidence.append(f"SNI({', '.join(snis[:3])})")
                 if frps:
-                    evidence.append(f"FRP({len(frps)} tunnels)")
-                print(f"  {C.R}[!] {ip:<16}{C.END} {' | '.join(evidence[:3])}")
+                    evidence.append(f"FRP({dev.get('counts', {}).get('frp', len(frps))} tunnels)")
+                if cloud_ips:
+                    evidence.append(f"CLOUD_IP({', '.join(cloud_ips[:3])})")
+                if not evidence:
+                    # Cloud via an S3/auth/api SNI category counter with no
+                    # retained hostname sample — name the signal so the verdict
+                    # is never unexplained.
+                    fs = self.flow_stats[ip]
+                    sig = [k for k in ("s3_uploads", "auth_tls", "cloud_api") if fs.get(k)]
+                    evidence.append(f"TLS_CATEGORY({', '.join(sig)})" if sig else "cloud signal")
+                print(f"  {C.R}[!] {ip:<16}{C.END} {' | '.join(evidence[:4])}")
 
         # All Flock domains seen
         flock_domains = sorted(
@@ -639,8 +754,8 @@ class FlockTrafficTap:
             for d in flock_domains:
                 print(f"  ﹒ {d}")
 
-        # FRP tunnels
-        total_frp = sum(len(dev.get("frp_tunnels", [])) for dev in self.devices.values())
+        # FRP tunnels (exact counter; the per-tunnel list below is a capped sample)
+        total_frp = sum(dev.get("counts", {}).get("frp", 0) for dev in self.devices.values())
         if total_frp > 0:
             print(f"\n{C.R}FRP Tunnels: {total_frp}{C.END}")
             for ip, dev in sorted(self.devices.items()):
@@ -697,12 +812,17 @@ def main():
     parser.add_argument("--tap-verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--tap-timeout", type=int, default=None, help="Capture duration (seconds)")
     parser.add_argument("--tap-filter", default=None, help="BPF filter expression")
+    parser.add_argument("--tap-max-samples", type=int, default=500,
+                        help="Cap on per-device raw samples kept (data minimization). Default 500.")
+    parser.add_argument("--tap-redact-ips", action="store_true",
+                        help="Salt-hash non-Flock destination IPs in stored samples (bystander protection).")
     args = parser.parse_args()
 
     tap = FlockTrafficTap(
         interface=args.tap_interface, pcap=args.tap_pcap, pipe=args.tap_pipe,
         verbose=args.tap_verbose, output_file=args.tap_output, timeout=args.tap_timeout,
-        filter_expr=args.tap_filter,
+        filter_expr=args.tap_filter, max_samples=args.tap_max_samples,
+        redact_non_flock_ips=args.tap_redact_ips,
     )
     if not args.tap_interface and not args.tap_pcap and not args.tap_pipe:
         parser.print_help()

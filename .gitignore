@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Capture / scan outputs
+*.pcap
+report.json
+creds_*.txt
+s3_urls_*.txt
